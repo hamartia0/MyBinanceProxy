@@ -38,8 +38,12 @@ export default async function handler(req, res) {
       totalUsdt: total
     });
   } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: err.message || String(err) });
+    console.error('API Handler Error:', err);
+    // 返回详细的错误信息，方便调试
+    return res.status(500).json({ 
+      error: err.message || String(err),
+      stack: process.env.NODE_ENV === 'development' ? err.stack : undefined
+    });
   }
 }
 
@@ -47,19 +51,25 @@ export default async function handler(req, res) {
  * 获取所有交易对的价格（公开API，不需要签名）
  */
 async function fetchAllPrices() {
-  const url = 'https://api.binance.com/api/v3/ticker/price';
-  const resp = await fetch(url);
+  try {
+    const url = 'https://api.binance.com/api/v3/ticker/price';
+    const resp = await fetch(url);
 
-  if (!resp.ok) {
-    throw new Error('Failed to fetch prices: ' + resp.status);
-  }
+    if (!resp.ok) {
+      throw new Error('Failed to fetch prices: ' + resp.status);
+    }
 
-  const priceList = await resp.json();
-  const priceMap = {};
-  for (const item of priceList) {
-    priceMap[item.symbol] = parseFloat(item.price);
+    const priceList = await resp.json();
+    const priceMap = {};
+    for (const item of priceList) {
+      priceMap[item.symbol] = parseFloat(item.price);
+    }
+    return priceMap;
+  } catch (err) {
+    // 价格获取失败不应该让整个接口崩溃，返回空对象
+    console.error('Error fetching prices:', err.message);
+    return {};
   }
-  return priceMap;
 }
 
 /**
@@ -99,44 +109,50 @@ function getPriceInUsdt(asset, prices) {
  * 获取现货账户所有币种换算为USDT的总价值
  */
 async function fetchSpotTotalUsdt(apiKey, secretKey, prices) {
-  const timestamp = Date.now();
-  const queryString = `timestamp=${timestamp}`;
-  const signature = crypto.createHmac('sha256', secretKey).update(queryString).digest('hex');
+  try {
+    const timestamp = Date.now();
+    const queryString = `timestamp=${timestamp}`;
+    const signature = crypto.createHmac('sha256', secretKey).update(queryString).digest('hex');
 
-  const url = `https://api.binance.com/api/v3/account?${queryString}&signature=${signature}`;
+    const url = `https://api.binance.com/api/v3/account?${queryString}&signature=${signature}`;
 
-  const resp = await fetch(url, {
-    method: 'GET',
-    headers: {
-      'X-MBX-APIKEY': apiKey
+    const resp = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'X-MBX-APIKEY': apiKey
+      }
+    });
+
+    if (!resp.ok) {
+      // 现货失败就当 0，不要让整个接口挂掉
+      console.warn('Spot account API failed:', resp.status);
+      return 0;
     }
-  });
 
-  if (!resp.ok) {
-    // 现货失败就当 0，不要让整个接口挂掉
+    const data = await resp.json();
+    let totalUsdt = 0;
+
+    for (const balance of data.balances || []) {
+      const free = parseFloat(balance.free || 0);
+      const locked = parseFloat(balance.locked || 0);
+      const total = free + locked;
+
+      // 跳过余额为0的币种
+      if (total <= 0) {
+        continue;
+      }
+
+      const asset = balance.asset;
+      const priceInUsdt = getPriceInUsdt(asset, prices);
+      const assetValueInUsdt = total * priceInUsdt;
+      totalUsdt += assetValueInUsdt;
+    }
+
+    return totalUsdt;
+  } catch (err) {
+    console.error('Error fetching spot balance:', err.message);
     return 0;
   }
-
-  const data = await resp.json();
-  let totalUsdt = 0;
-
-  for (const balance of data.balances || []) {
-    const free = parseFloat(balance.free || 0);
-    const locked = parseFloat(balance.locked || 0);
-    const total = free + locked;
-
-    // 跳过余额为0的币种
-    if (total <= 0) {
-      continue;
-    }
-
-    const asset = balance.asset;
-    const priceInUsdt = getPriceInUsdt(asset, prices);
-    const assetValueInUsdt = total * priceInUsdt;
-    totalUsdt += assetValueInUsdt;
-  }
-
-  return totalUsdt;
 }
 
 /**
@@ -144,45 +160,50 @@ async function fetchSpotTotalUsdt(apiKey, secretKey, prices) {
  * 逐仓模式常用于合约网格机器人，这部分资金不包含在 totalMarginBalance 中
  */
 async function fetchFuturesBalance(apiKey, secretKey) {
-  const timestamp = Date.now();
-  const queryString = `timestamp=${timestamp}`;
-  const signature = crypto.createHmac('sha256', secretKey).update(queryString).digest('hex');
+  try {
+    const timestamp = Date.now();
+    const queryString = `timestamp=${timestamp}`;
+    const signature = crypto.createHmac('sha256', secretKey).update(queryString).digest('hex');
 
-  const url = `https://fapi.binance.com/fapi/v2/account?${queryString}&signature=${signature}`;
+    const url = `https://fapi.binance.com/fapi/v2/account?${queryString}&signature=${signature}`;
 
-  const resp = await fetch(url, {
-    method: 'GET',
-    headers: {
-      'X-MBX-APIKEY': apiKey
+    const resp = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'X-MBX-APIKEY': apiKey
+      }
+    });
+
+    if (!resp.ok) {
+      console.warn('Failed to fetch futures balance:', resp.status);
+      return { cross: 0, isolated: 0, total: 0 };
     }
-  });
 
-  if (!resp.ok) {
-    console.warn('Failed to fetch futures balance:', resp.status);
+    const data = await resp.json();
+    
+    // 1. 全仓余额
+    const cross = parseFloat(data.totalMarginBalance || 0);
+    
+    // 2. 逐仓余额
+    let isolated = 0;
+    for (const position of data.positions || []) {
+      // 检查是否为逐仓
+      if (position.isolated === true || String(position.isolated) === 'true') {
+        const wallet = parseFloat(position.isolatedWallet || 0);
+        const pnl = parseFloat(position.unrealizedProfit || 0);
+        isolated += (wallet + pnl);
+      }
+    }
+    
+    return {
+      cross: cross,
+      isolated: isolated,
+      total: cross + isolated
+    };
+  } catch (err) {
+    console.warn('Error fetching futures balance:', err.message);
     return { cross: 0, isolated: 0, total: 0 };
   }
-
-  const data = await resp.json();
-  
-  // 1. 全仓余额
-  const cross = parseFloat(data.totalMarginBalance || 0);
-  
-  // 2. 逐仓余额
-  let isolated = 0;
-  for (const position of data.positions || []) {
-    // 检查是否为逐仓
-    if (position.isolated === true || String(position.isolated) === 'true') {
-      const wallet = parseFloat(position.isolatedWallet || 0);
-      const pnl = parseFloat(position.unrealizedProfit || 0);
-      isolated += (wallet + pnl);
-    }
-  }
-  
-  return {
-    cross: cross,
-    isolated: isolated,
-    total: cross + isolated
-  };
 }
 
 /**
@@ -235,13 +256,8 @@ async function fetchSpotAlgoBalance(apiKey, secretKey) {
     });
 
     if (!resp.ok) {
-      if (resp.status === 401) {
-        const errText = await resp.text();
-        console.warn(`Spot algo API 401: 权限验证失败。请确保API Key已开启"Enable Spot & Margin Trading" (即使是读取) - ${errText}`);
-      } else {
-        const errText = await resp.text();
-        console.warn(`Spot algo API error ${resp.status}: ${errText}`);
-      }
+      // 错误响应时不读取响应体，避免阻塞，直接返回0
+      console.warn(`Spot algo API error ${resp.status}`);
       return 0;
     }
 
@@ -290,13 +306,8 @@ async function fetchFuturesAlgoBalance(apiKey, secretKey) {
     });
 
     if (!resp.ok) {
-      if (resp.status === 401) {
-        const errText = await resp.text();
-        console.warn(`Futures algo API 401: 权限验证失败。请确保API Key已开启"Enable Futures" (即使是读取) - ${errText}`);
-      } else {
-        const errText = await resp.text();
-        console.warn(`Futures algo API error ${resp.status}: ${errText}`);
-      }
+      // 错误响应时不读取响应体，避免阻塞，直接返回0
+      console.warn(`Futures algo API error ${resp.status}`);
       return 0;
     }
 
