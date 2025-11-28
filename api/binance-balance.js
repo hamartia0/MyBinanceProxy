@@ -14,35 +14,52 @@ export default async function handler(req, res) {
   }
 
   try {
-    // 1. 获取所有币种价格（公开API，不需要签名）
-    const prices = await fetchAllPrices();
-
-    // 2. 先查现货账户，获取所有币种并换算为USDT
-    const spot = await fetchSpotTotalUsdt(apiKey, secretKey, prices);
-
-    // 3. 查合约账户余额（包含全仓和逐仓，逐仓通常包含网格机器人资金）
-    const futures = await fetchFuturesBalance(apiKey, secretKey);
-
-    // 4. 查交易机器人账户余额 (SAPI)
-    const tradingBotSapi = await fetchTradingBotBalance(apiKey, secretKey, prices);
-
-    // 5. 汇总
-    const total = spot + futures.total + tradingBotSapi;
-
-    return res.status(200).json({
-      spotUsdt: spot,
-      futuresCrossUsdt: futures.cross,
-      futuresIsolatedUsdt: futures.isolated,
-      futuresTotalUsdt: futures.total,
-      tradingBotSapiUsdt: tradingBotSapi,
-      totalUsdt: total
+    // 使用 Promise.allSettled 并行执行，即使部分失败也能继续
+    // 设置总体超时保护（Vercel 函数默认 10 秒，我们设置 8 秒安全边界）
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(() => reject(new Error('Request timeout')), 8000);
     });
+
+    const fetchPromise = (async () => {
+      // 1. 获取所有币种价格（公开API，不需要签名）
+      const prices = await fetchAllPrices();
+
+      // 2-4. 并行查询三个账户（使用 Promise.allSettled 确保部分失败不影响其他）
+      const [spotResult, futuresResult, tradingBotResult] = await Promise.allSettled([
+        fetchSpotTotalUsdt(apiKey, secretKey, prices),
+        fetchFuturesBalance(apiKey, secretKey),
+        fetchTradingBotBalance(apiKey, secretKey, prices)
+      ]);
+
+      // 提取结果，失败时使用默认值
+      const spot = spotResult.status === 'fulfilled' ? spotResult.value : 0;
+      const futures = futuresResult.status === 'fulfilled' ? futuresResult.value : { cross: 0, isolated: 0, total: 0 };
+      const tradingBotSapi = tradingBotResult.status === 'fulfilled' ? tradingBotResult.value : 0;
+
+      // 5. 汇总
+      const total = spot + futures.total + tradingBotSapi;
+
+      return {
+        spotUsdt: spot,
+        futuresCrossUsdt: futures.cross,
+        futuresIsolatedUsdt: futures.isolated,
+        futuresTotalUsdt: futures.total,
+        tradingBotSapiUsdt: tradingBotSapi,
+        totalUsdt: total
+      };
+    })();
+
+    const result = await Promise.race([fetchPromise, timeoutPromise]);
+
+    return res.status(200).json(result);
   } catch (err) {
-    console.error('API Handler Error:', err);
-    // 返回详细的错误信息，方便调试
+    console.error('API Handler Error:', err.message);
+    // 确保始终返回有效的 JSON，即使是错误
     return res.status(500).json({ 
-      error: err.message || String(err),
-      stack: process.env.NODE_ENV === 'development' ? err.stack : undefined
+      error: err.message || 'Internal server error',
+      totalUsdt: 0,  // 确保 Apps Script 能获取到数字值
+      spotUsdt: 0,
+      futuresTotalUsdt: 0
     });
   }
 }
@@ -100,8 +117,7 @@ function getPriceInUsdt(asset, prices) {
     return prices[bnbPair] * prices['BNBUSDT'];
   }
 
-  // 如果找不到价格，返回0
-  console.warn(`Warning: Cannot find price for ${asset}`);
+  // 如果找不到价格，返回0（不记录警告，避免日志噪音）
   return 0;
 }
 
@@ -256,8 +272,8 @@ async function fetchSpotAlgoBalance(apiKey, secretKey) {
     });
 
     if (!resp.ok) {
-      // 错误响应时不读取响应体，避免阻塞，直接返回0
-      console.warn(`Spot algo API error ${resp.status}`);
+      // 权限错误（401）是预期的（用户可能未开启现货算法权限），不记录警告
+      // 其他错误也静默处理，避免日志噪音
       return 0;
     }
 
@@ -306,8 +322,8 @@ async function fetchFuturesAlgoBalance(apiKey, secretKey) {
     });
 
     if (!resp.ok) {
-      // 错误响应时不读取响应体，避免阻塞，直接返回0
-      console.warn(`Futures algo API error ${resp.status}`);
+      // 权限错误（401）是预期的（用户可能未开启合约算法权限），不记录警告
+      // 其他错误也静默处理，避免日志噪音
       return 0;
     }
 
