@@ -14,53 +14,108 @@ export default async function handler(req, res) {
   }
 
   try {
-    // 使用 Promise.allSettled 并行执行，即使部分失败也能继续
-    // 设置总体超时保护（Vercel 函数默认 10 秒，我们设置 8 秒安全边界）
-    const timeoutPromise = new Promise((_, reject) => {
-      setTimeout(() => reject(new Error('Request timeout')), 8000);
-    });
-
-    const fetchPromise = (async () => {
-      // 1. 获取所有币种价格（公开API，不需要签名）
+    // 使用统一钱包接口获取所有账户余额（包括交易机器人）
+    // 接口：GET /sapi/v1/asset/wallet/balance
+    // 优势：一次性获取所有账户余额，已经折算成 USDT，包含交易机器人账户
+    // 这是币安官方推荐的方式，可以获取到完整的账户总览
+    const walletBalances = await fetchWalletBalances(apiKey, secretKey);
+    
+    // 解析统一钱包接口返回的数据
+    let spotUsdt = 0;
+    let futuresTotalUsdt = 0;
+    let tradingBotUsdt = 0;
+    let totalUsdt = 0;
+    
+    // 遍历所有钱包类型，提取各个账户余额
+    for (const wallet of walletBalances || []) {
+      const balance = parseFloat(wallet.balance || 0);
+      const walletName = wallet.walletName || '';
+      
+      // 根据钱包名称匹配对应的账户
+      if (walletName === 'Spot') {
+        spotUsdt = balance;
+      } else if (walletName === 'USDⓈ-M Futures' || walletName === 'USDT-M Futures') {
+        futuresTotalUsdt = balance;
+      } else if (walletName === 'Trading Bots') {
+        tradingBotUsdt = balance; // 交易机器人账户余额（网格、DCA 等策略资金）
+      }
+      
+      // 累加所有激活的钱包余额得到总资产
+      // 注意：统一钱包接口返回的总资产已经包含了所有账户，不需要手动累加单个账户
+      if (wallet.activate && balance > 0) {
+        totalUsdt += balance;
+      }
+    }
+    
+    // 如果统一钱包接口失败或返回空数据，回退到原来的方式
+    if (!walletBalances || walletBalances.length === 0) {
+      console.warn('统一钱包接口失败，使用回退方案');
+      // 回退方案：使用原有的接口分别查询各个账户
       const prices = await fetchAllPrices();
-
-      // 2-4. 并行查询三个账户（使用 Promise.allSettled 确保部分失败不影响其他）
-      const [spotResult, futuresResult, tradingBotResult] = await Promise.allSettled([
+      const [spotResult, futuresResult] = await Promise.allSettled([
         fetchSpotTotalUsdt(apiKey, secretKey, prices),
-        fetchFuturesBalance(apiKey, secretKey),
-        fetchTradingBotBalance(apiKey, secretKey, prices)
+        fetchFuturesBalance(apiKey, secretKey)
       ]);
-
-      // 提取结果，失败时使用默认值
-      const spot = spotResult.status === 'fulfilled' ? spotResult.value : 0;
+      
+      spotUsdt = spotResult.status === 'fulfilled' ? spotResult.value : spotUsdt;
       const futures = futuresResult.status === 'fulfilled' ? futuresResult.value : { cross: 0, isolated: 0, total: 0 };
-      const tradingBotSapi = tradingBotResult.status === 'fulfilled' ? tradingBotResult.value : 0;
+      futuresTotalUsdt = futures.total || futuresTotalUsdt;
+      // 回退方案无法获取交易机器人账户，所以 tradingBotUsdt 保持为 0
+      totalUsdt = spotUsdt + futuresTotalUsdt + tradingBotUsdt;
+    }
 
-      // 5. 汇总
-      const total = spot + futures.total + tradingBotSapi;
-
-      return {
-        spotUsdt: spot,
-        futuresCrossUsdt: futures.cross,
-        futuresIsolatedUsdt: futures.isolated,
-        futuresTotalUsdt: futures.total,
-        tradingBotSapiUsdt: tradingBotSapi,
-        totalUsdt: total
-      };
-    })();
-
-    const result = await Promise.race([fetchPromise, timeoutPromise]);
-
-    return res.status(200).json(result);
+    return res.status(200).json({
+      spotUsdt: spotUsdt,
+      futuresCrossUsdt: futuresTotalUsdt, // 统一钱包接口返回的是总合约余额
+      futuresIsolatedUsdt: 0, // 统一钱包接口不区分逐仓
+      futuresTotalUsdt: futuresTotalUsdt,
+      tradingBotUsdt: tradingBotUsdt, // 这是真正的交易机器人账户余额！
+      tradingBotSapiUsdt: 0, // 保留字段，但统一钱包接口已经包含了
+      totalUsdt: totalUsdt
+    });
   } catch (err) {
     console.error('API Handler Error:', err.message);
     // 确保始终返回有效的 JSON，即使是错误
     return res.status(500).json({ 
       error: err.message || 'Internal server error',
-      totalUsdt: 0,  // 确保 Apps Script 能获取到数字值
+      totalUsdt: 0,
       spotUsdt: 0,
-      futuresTotalUsdt: 0
+      futuresTotalUsdt: 0,
+      tradingBotUsdt: 0
     });
+  }
+}
+
+/**
+ * 获取统一钱包余额（包含所有账户：现货、合约、交易机器人等）
+ * GET /sapi/v1/asset/wallet/balance
+ * 这个接口已经把所有账户的余额都折算成指定的计价资产（默认BTC，可以指定USDT）
+ */
+async function fetchWalletBalances(apiKey, secretKey) {
+  try {
+    const timestamp = Date.now();
+    const queryString = `quoteAsset=USDT&timestamp=${timestamp}&recvWindow=60000`;
+    const signature = crypto.createHmac('sha256', secretKey).update(queryString).digest('hex');
+
+    const url = `https://api.binance.com/sapi/v1/asset/wallet/balance?${queryString}&signature=${signature}`;
+
+    const resp = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'X-MBX-APIKEY': apiKey
+      }
+    });
+
+    if (!resp.ok) {
+      console.warn('Wallet balance API failed:', resp.status);
+      return [];
+    }
+
+    const data = await resp.json();
+    return Array.isArray(data) ? data : [];
+  } catch (err) {
+    console.warn('Error fetching wallet balances:', err.message);
+    return [];
   }
 }
 

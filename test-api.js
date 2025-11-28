@@ -28,10 +28,19 @@ const mockRes = {
     // 如果成功，显示格式化结果
     if (this.statusCode === 200 && data.totalUsdt !== undefined) {
       console.log('\n=== 账户余额汇总 ===');
-      console.log(`现货账户 (USDT): ${data.spotUsdt.toFixed(2)}`);
-      console.log(`合约全仓 (USDT): ${data.futuresCrossUsdt.toFixed(2)}`);
-      console.log(`合约逐仓/机器人 (USDT): ${data.futuresIsolatedUsdt.toFixed(2)}`);
+      console.log(`现货账户 (USDT): ${(data.spotUsdt || 0).toFixed(2)}`);
+      console.log(`合约账户 (USDT): ${(data.futuresTotalUsdt || 0).toFixed(2)}`);
+      if (data.tradingBotUsdt && data.tradingBotUsdt > 0) {
+        console.log(`交易机器人账户 (USDT): ${data.tradingBotUsdt.toFixed(2)}`);
+      }
       console.log(`总资产 (USDT): ${data.totalUsdt.toFixed(2)}`);
+      console.log('\n--- 详细字段 ---');
+      if (data.futuresCrossUsdt !== undefined) {
+        console.log(`  合约全仓: ${(data.futuresCrossUsdt || 0).toFixed(2)}`);
+      }
+      if (data.futuresIsolatedUsdt !== undefined && data.futuresIsolatedUsdt > 0) {
+        console.log(`  合约逐仓: ${data.futuresIsolatedUsdt.toFixed(2)}`);
+      }
     }
     
     return this;
