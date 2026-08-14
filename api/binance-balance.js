@@ -22,8 +22,14 @@ export default async function handler(req, res) {
     
     // 解析统一钱包接口返回的数据
     let spotUsdt = 0;
+    let fundingUsdt = 0;
     let futuresTotalUsdt = 0;
+    let coinMFuturesUsdt = 0;
+    let marginUsdt = 0;
+    let earnUsdt = 0;
     let tradingBotUsdt = 0;
+    let optionsUsdt = 0;
+    let copyTradingUsdt = 0;
     let totalUsdt = 0;
     
     // 遍历所有钱包类型，提取各个账户余额
@@ -34,10 +40,22 @@ export default async function handler(req, res) {
       // 根据钱包名称匹配对应的账户
       if (walletName === 'Spot') {
         spotUsdt = balance;
+      } else if (walletName === 'Funding') {
+        fundingUsdt = balance;
       } else if (walletName === 'USDⓈ-M Futures' || walletName === 'USDT-M Futures') {
         futuresTotalUsdt = balance;
+      } else if (walletName === 'COIN-M Futures') {
+        coinMFuturesUsdt = balance;
+      } else if (walletName === 'Cross Margin' || walletName === 'Isolated Margin') {
+        marginUsdt += balance;
+      } else if (walletName === 'Earn') {
+        earnUsdt = balance;
       } else if (walletName === 'Trading Bots') {
         tradingBotUsdt = balance; // 交易机器人账户余额（网格、DCA 等策略资金）
+      } else if (walletName === 'Options') {
+        optionsUsdt = balance;
+      } else if (walletName === 'Copy Trading') {
+        copyTradingUsdt = balance;
       }
       
       // 累加所有激活的钱包余额得到总资产
@@ -47,30 +65,35 @@ export default async function handler(req, res) {
       }
     }
     
-    // 如果统一钱包接口失败或返回空数据，回退到原来的方式
+    // 统一钱包失败时不能回退到不完整口径，否则会把缺少的钱包静默记成 0。
     if (!walletBalances || walletBalances.length === 0) {
-      console.warn('统一钱包接口失败，使用回退方案');
-      // 回退方案：使用原有的接口分别查询各个账户
-      const prices = await fetchAllPrices();
-      const [spotResult, futuresResult] = await Promise.allSettled([
-        fetchSpotTotalUsdt(apiKey, secretKey, prices),
-        fetchFuturesBalance(apiKey, secretKey)
-      ]);
-      
-      spotUsdt = spotResult.status === 'fulfilled' ? spotResult.value : spotUsdt;
-      const futures = futuresResult.status === 'fulfilled' ? futuresResult.value : { cross: 0, isolated: 0, total: 0 };
-      futuresTotalUsdt = futures.total || futuresTotalUsdt;
-      // 回退方案无法获取交易机器人账户，所以 tradingBotUsdt 保持为 0
-      totalUsdt = spotUsdt + futuresTotalUsdt + tradingBotUsdt;
+      throw new Error('Binance wallet balance returned no wallets');
     }
+
+    const mainTotalUsdt = totalUsdt;
+    const subAccounts = await fetchSubAccountsTotalUsdt(apiKey, secretKey);
+    totalUsdt += subAccounts.totalUsdt;
 
     return res.status(200).json({
       spotUsdt: spotUsdt,
+      fundingUsdt: fundingUsdt,
       futuresCrossUsdt: futuresTotalUsdt, // 统一钱包接口返回的是总合约余额
       futuresIsolatedUsdt: 0, // 统一钱包接口不区分逐仓
       futuresTotalUsdt: futuresTotalUsdt,
+      coinMFuturesUsdt: coinMFuturesUsdt,
+      marginUsdt: marginUsdt,
+      earnUsdt: earnUsdt,
       tradingBotUsdt: tradingBotUsdt, // 这是真正的交易机器人账户余额！
       tradingBotSapiUsdt: 0, // 保留字段，但统一钱包接口已经包含了
+      optionsUsdt: optionsUsdt,
+      copyTradingUsdt: copyTradingUsdt,
+      mainTotalUsdt: mainTotalUsdt,
+      subAccountCount: subAccounts.count,
+      subAccountsSpotUsdt: subAccounts.spotUsdt,
+      subAccountsUsdMFuturesUsdt: subAccounts.usdMFuturesUsdt,
+      subAccountsCoinMFuturesUsdt: subAccounts.coinMFuturesUsdt,
+      subAccountsMarginUsdt: subAccounts.marginUsdt,
+      subAccountsTotalUsdt: subAccounts.totalUsdt,
       totalUsdt: totalUsdt
     });
   } catch (err) {
@@ -117,6 +140,196 @@ async function fetchWalletBalances(apiKey, secretKey) {
     console.warn('Error fetching wallet balances:', err.message);
     return [];
   }
+}
+
+/**
+ * 主账户的 wallet/balance 不包含子账户。这里使用主账户只读接口，汇总所有启用子账户：
+ * - 现货：spotSummary 返回 BTC 估值
+ * - U 本位合约：totalMarginBalance（含未实现盈亏）
+ * - 币本位合约：逐资产 marginBalance 换算成 USDT
+ * - 杠杆：totalNetAssetOfBtc（净资产，已扣负债）
+ * 任一必需接口失败时直接报错，避免把不完整余额写进每日统计。
+ */
+async function fetchSubAccountsTotalUsdt(apiKey, secretKey) {
+  const list = await signedGet('/sapi/v1/sub-account/list', {}, apiKey, secretKey);
+  const subAccounts = (list.subAccounts || []).filter(account => account.isFreeze !== true);
+
+  if (subAccounts.length === 0) {
+    return emptySubAccountSummary();
+  }
+
+  const [statuses, prices] = await Promise.all([
+    signedGet('/sapi/v1/sub-account/status', {}, apiKey, secretKey),
+    fetchAllPrices()
+  ]);
+
+  if (!prices.BTCUSDT) {
+    throw new Error('BTCUSDT price unavailable for sub-account valuation');
+  }
+
+  const statusByEmail = new Map(
+    (Array.isArray(statuses) ? statuses : []).map(status => [status.email, status])
+  );
+
+  const summaries = await Promise.all(subAccounts.map(account => {
+    const status = statusByEmail.get(account.email);
+    if (!status) {
+      throw new Error('Sub-account status unavailable');
+    }
+    return fetchOneSubAccountUsdt(
+      account.email,
+      status,
+      prices,
+      apiKey,
+      secretKey
+    );
+  }));
+
+  return summaries.reduce((total, item) => ({
+    count: total.count + 1,
+    spotUsdt: total.spotUsdt + item.spotUsdt,
+    usdMFuturesUsdt: total.usdMFuturesUsdt + item.usdMFuturesUsdt,
+    coinMFuturesUsdt: total.coinMFuturesUsdt + item.coinMFuturesUsdt,
+    marginUsdt: total.marginUsdt + item.marginUsdt,
+    totalUsdt: total.totalUsdt + item.totalUsdt
+  }), emptySubAccountSummary());
+}
+
+function emptySubAccountSummary() {
+  return {
+    count: 0,
+    spotUsdt: 0,
+    usdMFuturesUsdt: 0,
+    coinMFuturesUsdt: 0,
+    marginUsdt: 0,
+    totalUsdt: 0
+  };
+}
+
+async function fetchOneSubAccountUsdt(email, status, prices, apiKey, secretKey) {
+  const requests = [
+    fetchSubAccountSpotUsdt(email, prices, apiKey, secretKey),
+    status.isFutureEnabled === true
+      ? fetchSubAccountUsdMFuturesUsdt(email, apiKey, secretKey)
+      : Promise.resolve(0),
+    status.isFutureEnabled === true
+      ? fetchSubAccountCoinMFuturesUsdt(email, prices, apiKey, secretKey)
+      : Promise.resolve(0),
+    status.isMarginEnabled === true
+      ? fetchSubAccountMarginUsdt(email, prices, apiKey, secretKey)
+      : Promise.resolve(0)
+  ];
+
+  const [spotUsdt, usdMFuturesUsdt, coinMFuturesUsdt, marginUsdt] = await Promise.all(requests);
+
+  return {
+    spotUsdt,
+    usdMFuturesUsdt,
+    coinMFuturesUsdt,
+    marginUsdt,
+    totalUsdt: spotUsdt + usdMFuturesUsdt + coinMFuturesUsdt + marginUsdt
+  };
+}
+
+async function fetchSubAccountSpotUsdt(email, prices, apiKey, secretKey) {
+  const data = await signedGet(
+    '/sapi/v1/sub-account/spotSummary',
+    { email },
+    apiKey,
+    secretKey
+  );
+  const rows = data.spotSubUserAssetBtcVoList || [];
+  const account = rows.find(row => row.email === email) || rows[0];
+  if (!account) {
+    throw new Error('Sub-account spot summary unavailable');
+  }
+  return parseFloat(account?.totalAsset || 0) * prices.BTCUSDT;
+}
+
+async function fetchSubAccountUsdMFuturesUsdt(email, apiKey, secretKey) {
+  const data = await signedGet(
+    '/sapi/v2/sub-account/futures/account',
+    { email, futuresType: 1 },
+    apiKey,
+    secretKey
+  );
+  if (!data.futureAccountResp) {
+    throw new Error('Sub-account USD-M futures summary unavailable');
+  }
+  return parseFloat(data.futureAccountResp?.totalMarginBalance || 0);
+}
+
+async function fetchSubAccountCoinMFuturesUsdt(email, prices, apiKey, secretKey) {
+  const data = await signedGet(
+    '/sapi/v2/sub-account/futures/account',
+    { email, futuresType: 2 },
+    apiKey,
+    secretKey
+  );
+  if (!data.deliveryAccountResp) {
+    throw new Error('Sub-account COIN-M futures summary unavailable');
+  }
+  const assets = data.deliveryAccountResp?.assets || [];
+
+  return assets.reduce((total, asset) => {
+    const marginBalance = parseFloat(asset.marginBalance || 0);
+    if (marginBalance === 0) {
+      return total;
+    }
+    const price = requirePriceInUsdt(asset.asset, prices);
+    return total + marginBalance * price;
+  }, 0);
+}
+
+async function fetchSubAccountMarginUsdt(email, prices, apiKey, secretKey) {
+  const data = await signedGet(
+    '/sapi/v1/sub-account/margin/account',
+    { email },
+    apiKey,
+    secretKey
+  );
+  if (data.totalNetAssetOfBtc === undefined) {
+    throw new Error('Sub-account margin summary unavailable');
+  }
+  return parseFloat(data.totalNetAssetOfBtc || 0) * prices.BTCUSDT;
+}
+
+function requirePriceInUsdt(asset, prices) {
+  if (asset === 'USD' || asset === 'USDT') {
+    return 1;
+  }
+  const price = getPriceInUsdt(asset, prices);
+  if (!price) {
+    throw new Error(`USDT price unavailable for ${asset}`);
+  }
+  return price;
+}
+
+async function signedGet(path, params, apiKey, secretKey) {
+  const query = new URLSearchParams({
+    ...params,
+    timestamp: String(Date.now()),
+    recvWindow: '60000'
+  });
+  const signature = crypto
+    .createHmac('sha256', secretKey)
+    .update(query.toString())
+    .digest('hex');
+
+  const resp = await fetch(
+    `https://api.binance.com${path}?${query.toString()}&signature=${signature}`,
+    {
+      method: 'GET',
+      headers: { 'X-MBX-APIKEY': apiKey }
+    }
+  );
+
+  if (!resp.ok) {
+    const body = await resp.text();
+    throw new Error(`Binance ${path} failed: ${resp.status} ${body.slice(0, 200)}`);
+  }
+
+  return resp.json();
 }
 
 /**
